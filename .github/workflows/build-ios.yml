@@ -1,0 +1,67 @@
+name: Build iOS IPA
+
+# Run manually from the Actions tab, or automatically on every push to main.
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Show available Xcode versions (for debugging if a step fails)
+        run: ls /Applications | grep Xcode
+
+      - name: Inject Gemini API key from GitHub Secret
+        # Writes Sources/Secrets.swift using the GEMINI_API_KEY secret you
+        # add under Settings > Secrets and variables > Actions in your repo.
+        # This file only ever exists on the ephemeral CI runner — it is
+        # never written back to the repo, so the real key never appears in
+        # git history or logs (GitHub automatically masks secret values in
+        # the log output).
+        run: |
+          cat > Sources/Secrets.swift << 'EOF'
+          import Foundation
+          enum Secrets {
+              static let geminiAPIKey = "${{ secrets.GEMINI_API_KEY }}"
+          }
+          EOF
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate the .xcodeproj from project.yml
+        run: xcodegen generate
+
+      - name: Build an unsigned Release archive
+        run: |
+          xcodebuild \
+            -project GeminiOCRScanner.xcodeproj \
+            -scheme GeminiOCRScanner \
+            -configuration Release \
+            -sdk iphoneos \
+            -archivePath build/GeminiOCRScanner.xcarchive \
+            -destination "generic/platform=iOS" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            archive
+
+      - name: Package the .app into a sideloadable .ipa
+        run: |
+          mkdir -p build/Payload
+          cp -r "build/GeminiOCRScanner.xcarchive/Products/Applications/GeminiOCRScanner.app" build/Payload/
+          cd build && zip -r GeminiOCRScanner.ipa Payload
+
+      - name: Upload the IPA as a downloadable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GeminiOCRScanner-ipa
+          path: build/GeminiOCRScanner.ipa
