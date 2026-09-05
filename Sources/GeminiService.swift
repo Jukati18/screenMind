@@ -31,8 +31,11 @@ final class GeminiService {
 
     /// - Parameters:
     ///   - apiKey: get one at https://aistudio.google.com/app/apikey
-    ///   - model: "gemini-2.0-flash" (recommended) or "gemini-1.5-flash".
-    init(apiKey: String = "YOUR_GEMINI_API_KEY", model: String = "gemini-2.0-flash") {
+    ///   - model: "gemini-flash-latest" always tracks Google's newest Flash
+    ///     model — convenient, but behavior can shift when Google repoints
+    ///     it. Use a versioned name (e.g. "gemini-2.5-flash") instead if you
+    ///     want to control exactly when the model changes.
+    init(apiKey: String = "YOUR_GEMINI_API_KEY", model: String = "gemini-flash-latest") {
         self.apiKey = apiKey
         self.model = model
     }
