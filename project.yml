@@ -1,0 +1,27 @@
+name: GeminiOCRScanner
+options:
+  bundleIdPrefix: com.yourname
+  deploymentTarget:
+    iOS: "17.0"
+
+targets:
+  GeminiOCRScanner:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+    info:
+      path: Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.yourname.geminiocrscanner
+        PRODUCT_NAME: GeminiOCRScanner
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+        # No signing configured here on purpose — CI produces an UNSIGNED
+        # app bundle. Sideloadly / AltStore do the actual code signing on
+        # your own computer using your free Apple ID at install time.
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""
