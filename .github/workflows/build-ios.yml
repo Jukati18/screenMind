@@ -14,6 +14,13 @@ jobs:
       - name: Check out the repo
         uses: actions/checkout@v4
 
+      - name: Select the newest available Xcode on this runner
+        run: |
+          XCODE_PATH=$(ls -d /Applications/Xcode_*.app | sort -V | tail -n 1)
+          echo "Selecting $XCODE_PATH"
+          sudo xcode-select -s "$XCODE_PATH"
+          xcodebuild -version
+
       - name: Show available Xcode versions (for debugging if a step fails)
         run: ls /Applications | grep Xcode
 
@@ -39,6 +46,15 @@ jobs:
 
       - name: Generate the .xcodeproj from project.yml
         run: xcodegen generate
+
+      - name: Patch project format for Xcode 15 compatibility
+        # Recent XcodeGen releases hardcode objectVersion = 77, a format only
+        # Xcode 16+ can open — the `xcodeVersion` project.yml option doesn't
+        # currently override this (XcodeGen issue #1578). Force it down to a
+        # value Xcode 15.4 on this runner can read.
+        run: |
+          PBX="GeminiOCRScanner.xcodeproj/project.pbxproj"
+          sed -i '' 's/objectVersion = [0-9]*;/objectVersion = 60;/' "$PBX"
 
       - name: Build an unsigned Release archive
         run: |
