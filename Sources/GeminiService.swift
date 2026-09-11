@@ -5,6 +5,9 @@ enum GeminiError: Error, LocalizedError {
     case invalidResponse
     case apiError(String)
     case emptyAnswer
+    // CHANGE: dedicated case for HTTP 429 so callers can back off intelligently
+    // instead of treating it like any other API error.
+    case rateLimited(retryAfter: TimeInterval?)
 
     var errorDescription: String? {
         switch self {
@@ -12,6 +15,13 @@ enum GeminiError: Error, LocalizedError {
         case .invalidResponse: return "Invalid response from Gemini."
         case .apiError(let msg): return "Gemini API error: \(msg)"
         case .emptyAnswer: return "Gemini returned an empty answer."
+        // CHANGE: friendly, user-facing message instead of raw JSON;
+        // includes the wait time when Google gave us one.
+        case .rateLimited(let retryAfter):
+            if let retryAfter {
+                return "Rate limit reached. Retrying in \(Int(retryAfter.rounded()))s…"
+            }
+            return "Rate limit reached. Please wait a moment and try again."
         }
     }
 }
@@ -73,8 +83,23 @@ final class GeminiService {
         guard let httpResponse = response as? HTTPURLResponse else {
             throw GeminiError.invalidResponse
         }
+
+        // CHANGE: 429 is handled as its own branch before the generic error
+        // branch below, so we can surface a clean "rate limited" state and
+        // hand the caller a concrete retry delay (parsed from Google's
+        // error body) instead of a wall of raw JSON.
+        if httpResponse.statusCode == 429 {
+            let retryAfter = Self.parseRetryDelay(from: data)
+            throw GeminiError.rateLimited(retryAfter: retryAfter)
+        }
+
         guard (200..<300).contains(httpResponse.statusCode) else {
-            let message = String(data: data, encoding: .utf8) ?? "HTTP \(httpResponse.statusCode)"
+            // CHANGE: try to pull just the human-readable "message" field out
+            // of Google's error JSON; fall back to the raw body only if that
+            // fails, so the UI isn't stuck showing an unparsed JSON blob.
+            let message = Self.parseErrorMessage(from: data)
+                ?? String(data: data, encoding: .utf8)
+                ?? "HTTP \(httpResponse.statusCode)"
             throw GeminiError.apiError(message)
         }
 
@@ -131,5 +156,45 @@ final class GeminiService {
             throw GeminiError.emptyAnswer
         }
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // CHANGE: new helper — decodes Google's standard error envelope
+    // ({"error": {"message": ..., "details": [...]}}) and returns just the
+    // "message" string, so callers don't have to show raw JSON to the user.
+    private static func parseErrorMessage(from data: Data) -> String? {
+        struct ErrorEnvelope: Decodable {
+            struct ErrorBody: Decodable {
+                let message: String?
+            }
+            let error: ErrorBody?
+        }
+        guard let decoded = try? JSONDecoder().decode(ErrorEnvelope.self, from: data) else {
+            return nil
+        }
+        return decoded.error?.message
+    }
+
+    // CHANGE: new helper — Google's 429 body includes a
+    // "RetryInfo" detail with a "retryDelay" field like "37.918131066s".
+    // This pulls the numeric seconds out of that string so MainViewModel can
+    // schedule an automatic retry instead of just failing silently.
+    private static func parseRetryDelay(from data: Data) -> TimeInterval? {
+        struct ErrorEnvelope: Decodable {
+            struct ErrorBody: Decodable {
+                struct Detail: Decodable {
+                    let retryDelay: String?
+                }
+                let details: [Detail]?
+            }
+            let error: ErrorBody?
+        }
+        guard let decoded = try? JSONDecoder().decode(ErrorEnvelope.self, from: data),
+              let detail = decoded.error?.details?.first(where: { $0.retryDelay != nil }),
+              let raw = detail.retryDelay else {
+            return nil
+        }
+        // raw looks like "37.918131066s" — strip the trailing "s".
+        let numeric = raw.hasSuffix("s") ? String(raw.dropLast()) : raw
+        return TimeInterval(numeric)
     }
 }
