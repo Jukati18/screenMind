@@ -10,8 +10,11 @@ targets:
     platform: iOS
     sources:
       - path: Sources
-    info:
-      path: Info.plist
+    # FIX (persistent NSCameraUsageDescription bug): removed the "info:
+    # path: Info.plist" block. XcodeGen's own info-handling mechanism was
+    # conflicting with the explicit INFOPLIST_FILE / GENERATE_INFOPLIST_FILE
+    # settings below and silently winning, so our real Info.plist never
+    # actually got wired in. Settings below are now the only mechanism.
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.yourname.geminiocrscanner
@@ -19,18 +22,9 @@ targets:
         SWIFT_VERSION: "5.0"
         TARGETED_DEVICE_FAMILY: "1"
         IPHONEOS_DEPLOYMENT_TARGET: "17.0"
-        # No signing configured here on purpose — CI produces an UNSIGNED
-        # app bundle. Sideloadly / AltStore do the actual code signing on
-        # your own computer using your free Apple ID at install time.
         CODE_SIGNING_ALLOWED: NO
         CODE_SIGNING_REQUIRED: NO
         CODE_SIGN_IDENTITY: ""
-        # FIX (crash: TCC / missing NSCameraUsageDescription): force Xcode
-        # to use our real Info.plist instead of silently auto-generating
-        # its own, which was dropping the camera usage key from the built app.
         GENERATE_INFOPLIST_FILE: NO
         INFOPLIST_FILE: Info.plist
-        # FIX: redundant safety net — bakes the camera usage string directly
-        # into build settings, so it reaches the binary's Info.plist even if
-        # the merge above is ever bypassed again by a future Xcode default.
         INFOPLIST_KEY_NSCameraUsageDescription: "This app uses the camera to scan text in real time."
