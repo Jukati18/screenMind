@@ -53,6 +53,10 @@ struct ContentView: View {
     private var topBar: some View {
         HStack(spacing: 12) {
             statusBadge
+            // CHANGE (#4 UI): shows the client-side daily-quota estimate next
+            // to the status badge, e.g. "3/20 today" — helps the user avoid
+            // wasting a tap when close to the free-tier RPD cap.
+            quotaBadge
             Spacer()
 
             Button {
@@ -92,6 +96,16 @@ struct ContentView: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(.ultraThinMaterial, in: Capsule())
+    }
+
+    // CHANGE: new small badge showing "{used}/{estimatedDailyQuota} today".
+    private var quotaBadge: some View {
+        Text("\(viewModel.requestsUsedToday)/\(viewModel.estimatedDailyQuota) today")
+            .font(.caption2.weight(.medium))
+            .foregroundStyle(.white.opacity(0.85))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(.ultraThinMaterial, in: Capsule())
     }
 
     private var statusColor: Color {
@@ -173,8 +187,20 @@ struct ContentView: View {
                 .disabled(viewModel.geminiAnswer.isEmpty)
             }
 
+            // CHANGE (#3): the manual trigger — replaces the old always-on
+            // auto-send loop. Disabled whenever there's nothing to ask,
+            // a request is already in flight, or OCR hasn't found text yet.
+            Button {
+                viewModel.askGemini()
+            } label: {
+                Label("Ask Gemini", systemImage: "sparkles")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(viewModel.currentOCRText.isEmpty || viewModel.state == .sendingToAI)
+
             ScrollView {
-                Text(viewModel.geminiAnswer.isEmpty ? "Waiting for content to scan…" : viewModel.geminiAnswer)
+                Text(viewModel.geminiAnswer.isEmpty ? "Point the camera at text, then tap Ask Gemini." : viewModel.geminiAnswer)
                     .font(.body)
                     .foregroundStyle(viewModel.geminiAnswer.isEmpty ? .secondary : .primary)
                     .frame(maxWidth: .infinity, alignment: .leading)

@@ -5,9 +5,12 @@ enum GeminiError: Error, LocalizedError {
     case invalidResponse
     case apiError(String)
     case emptyAnswer
-    // CHANGE: dedicated case for HTTP 429 so callers can back off intelligently
-    // instead of treating it like any other API error.
     case rateLimited(retryAfter: TimeInterval?)
+    // CHANGE: new case — surfaced only if BOTH the primary model and the
+    // fallback ("gemini-flash-latest") return 404. If just the primary
+    // model 404s, ask() silently retries on the fallback instead of
+    // throwing this — this case means we're truly out of options.
+    case modelUnavailable(triedModels: [String])
 
     var errorDescription: String? {
         switch self {
@@ -15,13 +18,14 @@ enum GeminiError: Error, LocalizedError {
         case .invalidResponse: return "Invalid response from Gemini."
         case .apiError(let msg): return "Gemini API error: \(msg)"
         case .emptyAnswer: return "Gemini returned an empty answer."
-        // CHANGE: friendly, user-facing message instead of raw JSON;
-        // includes the wait time when Google gave us one.
         case .rateLimited(let retryAfter):
             if let retryAfter {
                 return "Rate limit reached. Retrying in \(Int(retryAfter.rounded()))s…"
             }
             return "Rate limit reached. Please wait a moment and try again."
+        // CHANGE: user-facing message for the "nothing worked" case.
+        case .modelUnavailable(let triedModels):
+            return "No available Gemini model (tried: \(triedModels.joined(separator: ", "))). Check https://ai.google.dev/gemini-api/docs/models for current model names."
         }
     }
 }
@@ -38,26 +42,64 @@ final class GeminiService {
 
     private let apiKey: String
     private let model: String
+    // CHANGE: fallback model used only if `model` returns a 404 (model
+    // retired/renamed/never existed). "gemini-flash-latest" is Google's
+    // own alias that always resolves to *whatever* current Flash model is
+    // live, so it should never itself 404 — it's the safest possible net.
+    private let fallbackModel: String
 
     /// - Parameters:
     ///   - apiKey: get one at https://aistudio.google.com/app/apikey
-    ///   - model: "gemini-flash-latest" always tracks Google's newest Flash
-    ///     model — convenient, but behavior can shift when Google repoints
-    ///     it. Use a versioned name (e.g. "gemini-2.5-flash") instead if you
-    ///     want to control exactly when the model changes.
-    init(apiKey: String = "YOUR_GEMINI_API_KEY", model: String = "gemini-flash-latest") {
+    ///   - model: primary model to try first. Pinned to a lightweight model
+    ///     on purpose (see prior comment) rather than an alias, so its
+    ///     free-tier rate limit is predictable.
+    ///   - fallbackModel: CHANGE — used automatically if `model` 404s, so a
+    ///     model being deprecated doesn't hard-break the app. Defaults to
+    ///     Google's "latest Flash" alias.
+    init(
+        apiKey: String = "YOUR_GEMINI_API_KEY",
+        model: String = "gemini-2.0-flash-lite",
+        fallbackModel: String = "gemini-flash-latest"
+    ) {
         self.apiKey = apiKey
         self.model = model
+        self.fallbackModel = fallbackModel
     }
 
-    private var endpoint: URL? {
+    // CHANGE: endpoint is now parameterized by model so both the primary
+    // and fallback attempts can reuse the same URL-building logic.
+    private func endpoint(for model: String) -> URL? {
         URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent?key=\(apiKey)")
     }
 
     // MARK: - Request
 
     func ask(ocrText: String) async throws -> String {
-        guard let url = endpoint else { throw GeminiError.invalidURL }
+        // CHANGE: try the primary (lightweight) model first.
+        do {
+            return try await performRequest(ocrText: ocrText, model: model)
+        } catch GeminiError.apiError(let message) where Self.isModelNotFound(message) {
+            // CHANGE: primary model doesn't exist / was retired — silently
+            // retry once against the fallback alias instead of failing the
+            // whole call. Any other error type (429, network, etc.) is
+            // NOT caught here and propagates immediately as before.
+            do {
+                return try await performRequest(ocrText: ocrText, model: fallbackModel)
+            } catch GeminiError.apiError(let fallbackMessage) where Self.isModelNotFound(fallbackMessage) {
+                // CHANGE: even the fallback alias 404'd — very unusual, but
+                // report it clearly instead of a confusing generic error.
+                throw GeminiError.modelUnavailable(triedModels: [model, fallbackModel])
+            }
+            // Any other error from the fallback attempt (rate limit, etc.)
+            // propagates as-is from the inner `try`.
+        }
+        // Any non-404 error from the primary attempt propagates as-is.
+    }
+
+    // CHANGE: extracted the actual network call so both the primary and
+    // fallback attempts share identical request-building/parsing logic.
+    private func performRequest(ocrText: String, model: String) async throws -> String {
+        guard let url = endpoint(for: model) else { throw GeminiError.invalidURL }
 
         let prompt = Self.buildPrompt(from: ocrText)
 
@@ -84,19 +126,12 @@ final class GeminiService {
             throw GeminiError.invalidResponse
         }
 
-        // CHANGE: 429 is handled as its own branch before the generic error
-        // branch below, so we can surface a clean "rate limited" state and
-        // hand the caller a concrete retry delay (parsed from Google's
-        // error body) instead of a wall of raw JSON.
         if httpResponse.statusCode == 429 {
             let retryAfter = Self.parseRetryDelay(from: data)
             throw GeminiError.rateLimited(retryAfter: retryAfter)
         }
 
         guard (200..<300).contains(httpResponse.statusCode) else {
-            // CHANGE: try to pull just the human-readable "message" field out
-            // of Google's error JSON; fall back to the raw body only if that
-            // fails, so the UI isn't stuck showing an unparsed JSON blob.
             let message = Self.parseErrorMessage(from: data)
                 ?? String(data: data, encoding: .utf8)
                 ?? "HTTP \(httpResponse.statusCode)"
@@ -104,6 +139,16 @@ final class GeminiService {
         }
 
         return try Self.parseAnswer(from: data)
+    }
+
+    // CHANGE: distinguishes "model doesn't exist" from any other API error
+    // message. Google's 404 body reliably contains "is not found for API
+    // version" — matching on that substring rather than just status code
+    // 404 alone, since parseErrorMessage already discarded the numeric
+    // status code by the time this is checked.
+    private static func isModelNotFound(_ message: String) -> Bool {
+        message.localizedCaseInsensitiveContains("is not found for API version")
+            || message.localizedCaseInsensitiveContains("NOT_FOUND")
     }
 
     // MARK: - Prompt engineering for dirty OCR text
@@ -158,14 +203,9 @@ final class GeminiService {
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    // CHANGE: new helper — decodes Google's standard error envelope
-    // ({"error": {"message": ..., "details": [...]}}) and returns just the
-    // "message" string, so callers don't have to show raw JSON to the user.
     private static func parseErrorMessage(from data: Data) -> String? {
         struct ErrorEnvelope: Decodable {
-            struct ErrorBody: Decodable {
-                let message: String?
-            }
+            struct ErrorBody: Decodable { let message: String? }
             let error: ErrorBody?
         }
         guard let decoded = try? JSONDecoder().decode(ErrorEnvelope.self, from: data) else {
@@ -174,16 +214,10 @@ final class GeminiService {
         return decoded.error?.message
     }
 
-    // CHANGE: new helper — Google's 429 body includes a
-    // "RetryInfo" detail with a "retryDelay" field like "37.918131066s".
-    // This pulls the numeric seconds out of that string so MainViewModel can
-    // schedule an automatic retry instead of just failing silently.
     private static func parseRetryDelay(from data: Data) -> TimeInterval? {
         struct ErrorEnvelope: Decodable {
             struct ErrorBody: Decodable {
-                struct Detail: Decodable {
-                    let retryDelay: String?
-                }
+                struct Detail: Decodable { let retryDelay: String? }
                 let details: [Detail]?
             }
             let error: ErrorBody?
@@ -193,7 +227,6 @@ final class GeminiService {
               let raw = detail.retryDelay else {
             return nil
         }
-        // raw looks like "37.918131066s" — strip the trailing "s".
         let numeric = raw.hasSuffix("s") ? String(raw.dropLast()) : raw
         return TimeInterval(numeric)
     }
