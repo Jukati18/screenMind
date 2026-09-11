@@ -69,6 +69,17 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             archive
+      
+      - name: Verify NSCameraUsageDescription made it into the built app
+        # FIX: catches the exact bug that caused the "launch and instantly
+        # close" crash — fails the build here instead of only discovering it
+        # after downloading, sideloading, and launching on a real iPhone.
+        run: |
+          BUILT_PLIST="build/GeminiOCRScanner.xcarchive/Products/Applications/GeminiOCRScanner.app/Info.plist"
+          if ! /usr/libexec/PlistBuddy -c "Print :NSCameraUsageDescription" "$BUILT_PLIST"; then
+            echo "::error::NSCameraUsageDescription missing from built Info.plist — app will crash on launch."
+            exit 1
+          fi
 
       - name: Package the .app into a sideloadable .ipa
         run: |

@@ -25,3 +25,12 @@ targets:
         CODE_SIGNING_ALLOWED: NO
         CODE_SIGNING_REQUIRED: NO
         CODE_SIGN_IDENTITY: ""
+        # FIX (crash: TCC / missing NSCameraUsageDescription): force Xcode
+        # to use our real Info.plist instead of silently auto-generating
+        # its own, which was dropping the camera usage key from the built app.
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: Info.plist
+        # FIX: redundant safety net — bakes the camera usage string directly
+        # into build settings, so it reaches the binary's Info.plist even if
+        # the merge above is ever bypassed again by a future Xcode default.
+        INFOPLIST_KEY_NSCameraUsageDescription: "This app uses the camera to scan text in real time."
