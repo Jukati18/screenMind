@@ -1,56 +1,65 @@
 import Vision
 import CoreVideo
-import CoreImage // CHANGE: needed to crop the pixel buffer ourselves before OCR, instead of letting Vision scan the whole frame and only filter results afterward.
+import CoreImage // needed to crop the pixel buffer ourselves before OCR, instead of letting Vision scan the whole frame and only filter results afterward.
 import UIKit
 
 /// Wraps VNRecognizeTextRequest. Stateless and cheap to call repeatedly —
 /// the throttling/frequency control lives in the view model, not here.
 final class OCRProcessor {
 
-    // CHANGE: one reusable CIContext for cropping, created once rather than
-    // per-call (CIContext setup has real overhead). Cropping itself is still
-    // cheap in practice since it only runs on the manual "Ask" tap, not on
-    // every live-preview frame.
+    // One reusable CIContext for cropping, created once rather than per-call
+    // (CIContext setup has real overhead). Cropping itself is still cheap in
+    // practice since it only runs on the manual "Ask" tap, not on every
+    // live-preview frame.
     private let ciContext = CIContext()
 
     /// Runs OCR on a single pixel buffer.
     /// - Parameters:
-    ///   - pixelBuffer: raw camera frame (BGRA).
+    ///   - pixelBuffer: raw camera frame (BGRA), always in the sensor's
+    ///     native landscape orientation — CameraManager no longer pre-rotates it.
     ///   - regionOfInterest: optional crop in Vision's normalized, bottom-left-origin
-    ///     coordinate space (0...1). Pass nil to scan the full frame.
-    ///   - recognitionLevel: CHANGE — now a parameter instead of a hardcoded
-    ///     `.fast`. The live preview keeps passing `.fast` (cheap, runs every
-    ///     ~1s); the manual "Ask" action now passes `.accurate` since it only
-    ///     runs once per tap and needs to read smaller multiple-choice text.
-    ///   - minimumTextHeight: CHANGE — now a parameter instead of a hardcoded
-    ///     0.02. Vision measures this as a fraction of the FULL analyzed
-    ///     image height, not the ROI box — so small answer-option text was
-    ///     being silently discarded before recognition even started.
-    ///   - cropToRegion: CHANGE — new flag. When true (and a regionOfInterest
-    ///     is given), the pixel buffer is physically cropped to that
-    ///     rectangle before Vision ever sees it, rather than asking Vision
-    ///     to scan the whole frame and filter results down to the ROI
-    ///     afterward. This makes the target text occupy nearly the whole
-    ///     analyzed image, so `minimumTextHeight` is checked against a far
-    ///     more favorable scale.
+    ///     coordinate space (0...1), defined against the UPRIGHT (post-rotation)
+    ///     image. Pass nil to scan the full frame.
+    ///   - recognitionLevel: the live preview passes `.fast` (cheap, runs every
+    ///     ~1s); the manual "Ask" action passes `.accurate` since it only runs
+    ///     once per tap and needs to read smaller multiple-choice text.
+    ///   - minimumTextHeight: fraction of the FULL analyzed image height —
+    ///     when cropToRegion is true, "full" means the small cropped image,
+    ///     so this can be set low without risking false positives elsewhere.
+    ///   - cropToRegion: when true (and a regionOfInterest is given), the
+    ///     pixel buffer is physically rotated upright and cropped to that
+    ///     rectangle before Vision ever sees it, so the target text occupies
+    ///     nearly the whole analyzed image.
     func recognizeText(
         in pixelBuffer: CVPixelBuffer,
         regionOfInterest: CGRect? = nil,
-        recognitionLevel: VNRequestTextRecognitionLevel = .fast, // CHANGE: default preserves old behavior for existing call sites.
-        minimumTextHeight: Float = 0.02, // CHANGE: default preserves old behavior for existing call sites.
-        cropToRegion: Bool = false // CHANGE: default false — existing preview call sites are unaffected unless they opt in.
+        recognitionLevel: VNRequestTextRecognitionLevel = .fast,
+        minimumTextHeight: Float = 0.02,
+        cropToRegion: Bool = false
     ) async -> String {
 
-        // CHANGE: if asked to crop, do it up front and drop Vision's own
-        // regionOfInterest entirely — the cropped buffer IS the region now,
-        // so there's nothing left for Vision to filter.
         var bufferToAnalyze = pixelBuffer
         var visionROI = regionOfInterest
+
+        // FIX: orientation is now resolved to exactly one value depending on
+        // path, instead of always hardcoding `.right`.
+        // - Full-frame path (cropToRegion false, or crop fails): the buffer
+        //   is still raw sensor landscape, so `.right` is correct here, same
+        //   as before.
+        // - Cropped path: cropPixelBuffer (below) now rotates the image to
+        //   upright itself, BEFORE cropping, so by the time Vision sees the
+        //   cropped buffer it is already correctly oriented — telling the
+        //   handler `.right` again here would rotate it a second time. This
+        //   double rotation was the actual root cause of garbage OCR results
+        //   like "i" or "f 7,1" even when the ROI box was positioned correctly.
+        var handlerOrientation: CGImagePropertyOrientation = .right
+
         if cropToRegion,
            let roi = regionOfInterest,
            let cropped = Self.cropPixelBuffer(pixelBuffer, toNormalizedRect: roi, using: ciContext) {
             bufferToAnalyze = cropped
             visionROI = nil
+            handlerOrientation = .up // FIX: crop already rotated the image upright — don't rotate again.
         }
 
         return await withCheckedContinuation { continuation in
@@ -66,26 +75,20 @@ final class OCRProcessor {
                 continuation.resume(returning: text)
             }
 
-            // CHANGE: recognitionLevel now comes from the caller instead of
-            // always being `.fast`.
             request.recognitionLevel = recognitionLevel
             request.recognitionLanguages = ["vi-VN", "en-US"]
             request.usesLanguageCorrection = true
-            // CHANGE: minimumTextHeight now comes from the caller instead
-            // of always being 0.02.
             request.minimumTextHeight = minimumTextHeight
 
-            // CHANGE: only set Vision's regionOfInterest when we did NOT
-            // already crop the buffer ourselves above.
+            // Only set Vision's regionOfInterest when we did NOT already
+            // crop the buffer ourselves above.
             if let visionROI {
                 request.regionOfInterest = visionROI
             }
 
-            // Back camera in portrait orientation needs `.right` so Vision reads
-            // the sensor's landscape buffer as upright text. Still correct after
-            // cropping — the crop happens in the buffer's own pixel space
-            // before this orientation hint is applied.
-            let handler = VNImageRequestHandler(cvPixelBuffer: bufferToAnalyze, orientation: .right, options: [:])
+            // FIX: orientation hint now comes from handlerOrientation
+            // (resolved above) instead of always being `.right`.
+            let handler = VNImageRequestHandler(cvPixelBuffer: bufferToAnalyze, orientation: handlerOrientation, options: [:])
             do {
                 try handler.perform([request])
             } catch {
@@ -94,17 +97,27 @@ final class OCRProcessor {
         }
     }
 
-    // MARK: - Cropping (CHANGE: new)
+    // MARK: - Cropping
 
     /// Crops `pixelBuffer` to `normalizedRect` (bottom-left-origin, 0...1 —
     /// the same coordinate space Vision's regionOfInterest uses) and returns
-    /// a new, smaller CVPixelBuffer containing just that region.
+    /// a new, smaller CVPixelBuffer containing just that region, already
+    /// rotated upright.
     private static func cropPixelBuffer(
         _ pixelBuffer: CVPixelBuffer,
         toNormalizedRect normalizedRect: CGRect,
         using context: CIContext
     ) -> CVPixelBuffer? {
-        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        let rawImage = CIImage(cvPixelBuffer: pixelBuffer)
+
+        // FIX: rotate the raw sensor-orientation image to upright FIRST,
+        // using the same rotation Vision would normally apply via the
+        // `.right` handler hint on the full-frame path. Previously this
+        // cropped the RAW, unrotated buffer using a rect defined in
+        // upright/bottom-left-origin coordinates — on a still-landscape
+        // buffer that rectangle lands on entirely the wrong pixels, which is
+        // why the crop silently grabbed nonsense instead of the question.
+        let ciImage = rawImage.oriented(.right)
         let extent = ciImage.extent
 
         // CIImage's coordinate space is already bottom-left-origin, matching

@@ -86,11 +86,6 @@ final class CameraManager: NSObject, ObservableObject {
                 self.session.addOutput(self.videoOutput)
             }
 
-            if let connection = self.videoOutput.connection(with: .video),
-               connection.isVideoOrientationSupported {
-                connection.videoOrientation = .portrait
-            }
-
             // Continuous autofocus/exposure noticeably improves OCR accuracy
             // on close-up text (books, worksheets) versus a fixed focus point.
             try? device.lockForConfiguration()
