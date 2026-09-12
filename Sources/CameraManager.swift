@@ -59,8 +59,11 @@ final class CameraManager: NSObject, ObservableObject {
             self.session.beginConfiguration()
             defer { self.session.commitConfiguration() }
 
-            // 720p is plenty for OCR and keeps CPU/battery cost down.
-            if self.session.canSetSessionPreset(.hd1280x720) {
+            if self.session.canSetSessionPreset(.hd1920x1080) {
+                self.session.sessionPreset = .hd1920x1080
+            } else if self.session.canSetSessionPreset(.hd1280x720) {
+                // CHANGE: kept the old 720p as a fallback for configurations
+                // that can't do 1080p.
                 self.session.sessionPreset = .hd1280x720
             }
 

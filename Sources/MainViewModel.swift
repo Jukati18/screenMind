@@ -15,64 +15,45 @@ final class MainViewModel: ObservableObject, CameraManagerDelegate {
     @Published var showOCROverlay: Bool = true
     @Published var history: [HistoryItem] = []
 
-    // CHANGE: exposes the client-side estimate of today's quota usage so
-    // the UI can show "x/20 today" and disable the Ask button pre-emptively.
-    // This is advisory only — Google's server-side quota is authoritative
-    // and may reset at a different time than local midnight — but it's
-    // enough to stop the user from tapping into an obvious 429.
     @Published var requestsUsedToday: Int = 0
-    let estimatedDailyQuota = 20 // matches the RPD shown for this project's free-tier Flash-Lite allocation in AI Studio
+    let estimatedDailyQuota = 20
 
-    /// Normalized ROI in UIKit space (origin top-left, 0...1). Converted to
-    /// Vision's bottom-left-origin space right before each OCR pass.
     @Published var regionOfInterest: CGRect = CGRect(x: 0.1, y: 0.32, width: 0.8, height: 0.36)
 
-    // MARK: - Dependencies (injected as concrete types per the required structure)
+    // MARK: - Dependencies
 
     let cameraManager = CameraManager()
     private let ocrProcessor = OCRProcessor()
-    // Key comes from Secrets.swift, which is gitignored locally and
-    // generated on the fly by CI from a GitHub Actions secret — never
-    // hardcoded here, never committed.
     private let geminiService = GeminiService(apiKey: Secrets.geminiAPIKey)
     private var changeDetector = TextChangeDetector()
 
+    // CHANGE: keeps the most recent camera frame around so the manual "Ask"
+    // action can run a fresh, high-accuracy, cropped OCR pass on demand,
+    // instead of reusing whatever the low-effort live-preview pass last saw.
+    private var latestPixelBuffer: CVPixelBuffer?
+
     // MARK: - Throttling state
 
-    /// Runs OCR at most once every `ocrInterval` seconds, per the 0.8–1.2s spec.
-    /// CHANGE: this still only controls the *live preview* text now — it no
-    /// longer drives any network call. OCR keeps running continuously so the
-    /// user can see what will be sent before they tap "Ask".
     private let ocrInterval: TimeInterval = 1.0
     private var lastOCRRunTime: Date = .distantPast
     private var isProcessingFrame = false
     private var currentGeminiTask: Task<Void, Never>?
 
-    // CHANGE: short cooldown on the manual "Ask" button — this is no longer
-    // guarding against a 1s auto-loop, just against accidental double-taps
-    // (e.g. someone mashing the button while a request is in flight).
     private let manualAskCooldown: TimeInterval = 3
     private var lastGeminiCallTime: Date = .distantPast
 
-    // CHANGE: cancellable auto-retry task scheduled after a 429.
     private var pendingRetryTask: Task<Void, Never>?
 
-    // CHANGE: #4 — in-memory cache of normalized-OCR-text -> answer. If the
-    // user re-asks about text they've effectively already asked about
-    // (same content, maybe reformatted by OCR jitter), we serve the cached
-    // answer instantly with zero network calls and zero quota cost.
     private var answerCache: [String: String] = [:]
-    private let answerCacheLimit = 50 // simple cap so this can't grow unbounded during a long session
+    private let answerCacheLimit = 50
 
-    // CHANGE: UserDefaults keys backing the daily quota counter, persisted
-    // across app launches/re-signs so the estimate survives a restart.
     private let quotaCountKey = "gemini_requests_used_today"
     private let quotaDateKey = "gemini_requests_date"
 
     init() {
         cameraManager.delegate = self
         cameraManager.checkPermissionsAndConfigure()
-        loadQuotaCounter() // CHANGE: restore (or reset, if it's a new day) the persisted daily count
+        loadQuotaCounter()
     }
 
     // MARK: - Controls
@@ -88,7 +69,7 @@ final class MainViewModel: ObservableObject, CameraManagerDelegate {
         state = .idle
         cameraManager.stopSession()
         currentGeminiTask?.cancel()
-        pendingRetryTask?.cancel() // CHANGE: don't let a queued retry fire after pausing
+        pendingRetryTask?.cancel()
     }
 
     func toggle() {
@@ -101,8 +82,6 @@ final class MainViewModel: ObservableObject, CameraManagerDelegate {
         geminiAnswer = ""
         changeDetector.reset()
         state = isRunning ? .scanning : .idle
-        // NOTE: deliberately NOT clearing answerCache here — cached answers
-        // stay valid even after clearing the visible history list.
     }
 
     func copyAnswer() {
@@ -114,11 +93,15 @@ final class MainViewModel: ObservableObject, CameraManagerDelegate {
 
     nonisolated func cameraManager(_ manager: CameraManager, didOutput pixelBuffer: CVPixelBuffer) {
         Task { @MainActor [weak self] in
+            // CHANGE: always store the freshest frame, independent of the
+            // preview OCR throttle below, so a tap on "Ask" always has an
+            // up-to-date buffer to run the accurate scan against.
+            self?.latestPixelBuffer = pixelBuffer
             await self?.handleFrame(pixelBuffer)
         }
     }
 
-    // MARK: - Frame handling / OCR (preview only — no network call here anymore)
+    // MARK: - Frame handling / OCR (preview only — unchanged: still .fast, uncropped, for a cheap live overlay)
 
     private func handleFrame(_ pixelBuffer: CVPixelBuffer) async {
         guard isRunning, !isProcessingFrame else { return }
@@ -130,20 +113,16 @@ final class MainViewModel: ObservableObject, CameraManagerDelegate {
         defer { isProcessingFrame = false }
 
         let visionROI = Self.convertToVisionSpace(regionOfInterest)
+        // NOTE: deliberately left as the old .fast / uncropped / 0.02 call —
+        // this is just the cheap live-preview text shown under the camera,
+        // not what gets sent to Gemini anymore (see performAccurateScanAndAsk).
         let text = await ocrProcessor.recognizeText(in: pixelBuffer, regionOfInterest: visionROI)
 
         guard !text.isEmpty else { return }
         currentOCRText = text
         if isRunning { state = .scanning }
-
-        // CHANGE (#3): removed the automatic `sendToGemini` call that used
-        // to fire here on every meaningful text change. OCR still runs
-        // continuously to keep `currentOCRText` live for the preview and
-        // for the "Ask Gemini" button to use, but nothing hits the network
-        // until the user explicitly taps Ask.
     }
 
-    /// UIKit's top-left-origin normalized rect -> Vision's bottom-left-origin normalized rect.
     private static func convertToVisionSpace(_ rect: CGRect) -> CGRect {
         CGRect(
             x: rect.minX,
@@ -153,21 +132,58 @@ final class MainViewModel: ObservableObject, CameraManagerDelegate {
         )
     }
 
-    // MARK: - Manual "Ask Gemini" trigger (CHANGE: replaces the old auto-send path)
+    // MARK: - Manual "Ask Gemini" trigger
 
-    /// Call this from a button tap. Handles, in order: double-tap cooldown,
-    /// cache lookup (#4), the "text hasn't really changed" dedupe check,
-    /// and the client-side daily quota estimate — only falling through to an
-    /// actual network call if none of those short-circuit it.
+    /// CHANGE: this no longer reuses the low-effort preview text. It now
+    /// kicks off a fresh, high-accuracy, ROI-cropped OCR pass first (see
+    /// performAccurateScanAndAsk), and only that result is ever sent to
+    /// Gemini or checked against cache/dedupe/quota.
     func askGemini() {
-        let text = currentOCRText
-        guard !text.isEmpty else { return }
+        // CHANGE: bail out immediately if we don't have a frame yet, before
+        // doing any OCR work at all.
+        guard let pixelBuffer = latestPixelBuffer else { return }
 
-        // Guard 1: accidental double-tap protection.
+        // Guard 1: accidental double-tap protection — checked first, before
+        // spending effort on an accurate OCR pass.
         let now = Date()
         guard now.timeIntervalSince(lastGeminiCallTime) >= manualAskCooldown else { return }
 
-        // Guard 2 (#4): exact/near-duplicate cache hit — instant, free, no quota used.
+        currentGeminiTask?.cancel()
+        pendingRetryTask?.cancel()
+        // CHANGE: reflects that real work (accurate OCR + possibly network)
+        // is starting now, not just the network call.
+        state = .sendingToAI
+
+        currentGeminiTask = Task { [weak self] in
+            guard let self else { return }
+            await self.performAccurateScanAndAsk(pixelBuffer: pixelBuffer)
+        }
+    }
+
+    // CHANGE: new — runs the high-accuracy, cropped-to-ROI OCR pass at the
+    // moment of the tap, then falls through into the same cache/dedupe/quota
+    // logic askGemini() used to run directly on the preview text.
+    private func performAccurateScanAndAsk(pixelBuffer: CVPixelBuffer) async {
+        let visionROI = Self.convertToVisionSpace(regionOfInterest)
+
+        let text = await ocrProcessor.recognizeText(
+            in: pixelBuffer,
+            regionOfInterest: visionROI,
+            recognitionLevel: .accurate,   // CHANGE: worth the extra cost since this only runs once per tap.
+            minimumTextHeight: 0.01,       // CHANGE: lowered so smaller multiple-choice text isn't filtered before recognition starts.
+            cropToRegion: true             // CHANGE: crop first so the text occupies nearly the whole analyzed image.
+        )
+
+        guard !text.isEmpty else {
+            // CHANGE: clear, actionable message instead of silently doing nothing.
+            state = .error("No text found in the scan box — reposition it over the question and try again.")
+            return
+        }
+
+        // CHANGE: reflect exactly what was actually sent/considered, since it
+        // may differ from the fast live-preview text.
+        currentOCRText = text
+
         let key = Self.normalize(text)
         if let cached = answerCache[key] {
             geminiAnswer = cached
@@ -175,32 +191,24 @@ final class MainViewModel: ObservableObject, CameraManagerDelegate {
             return
         }
 
-        // Guard 3 (#4): if this text isn't meaningfully different from the
-        // last text we actually sent to the API, there's nothing new to ask
-        // — avoid spending a request re-confirming the same content.
-        guard changeDetector.shouldSend(newText: text) else { return }
+        guard changeDetector.shouldSend(newText: text) else {
+            // CHANGE: reset state instead of leaving it stuck on "Sending to AI…"
+            // now that state is set earlier in askGemini().
+            state = isRunning ? .scanning : .idle
+            return
+        }
 
-        // Guard 4: client-side daily quota estimate. Advisory, not
-        // authoritative — Google's server is the real source of truth — but
-        // stops an obviously-futile tap from spending the cooldown window.
         guard requestsUsedToday < estimatedDailyQuota else {
             state = .error("Daily quota likely reached (~\(estimatedDailyQuota)/day free tier). Try again tomorrow or enable billing.")
             return
         }
 
-        currentGeminiTask?.cancel()
-        pendingRetryTask?.cancel()
-        state = .sendingToAI
-
-        currentGeminiTask = Task { [weak self] in
-            guard let self else { return }
-            await self.performGeminiRequest(text: text, cacheKey: key)
-        }
+        await performGeminiRequest(text: text, cacheKey: key)
     }
 
     private func performGeminiRequest(text: String, cacheKey: String) async {
         lastGeminiCallTime = Date()
-        incrementQuotaCounter() // CHANGE: count this attempt against today's estimate before we know the result — a 429 still consumed a real request server-side
+        incrementQuotaCounter()
 
         do {
             let answer = try await geminiService.ask(ocrText: text)
@@ -208,7 +216,7 @@ final class MainViewModel: ObservableObject, CameraManagerDelegate {
             geminiAnswer = answer
             state = .answerReady
             history.insert(HistoryItem(question: text, answer: answer, date: Date()), at: 0)
-            cacheAnswer(answer, for: cacheKey) // CHANGE (#4): remember this answer for next time
+            cacheAnswer(answer, for: cacheKey)
         } catch GeminiError.rateLimited(let retryAfter) {
             guard !Task.isCancelled else { return }
             let delay = retryAfter ?? manualAskCooldown
@@ -229,20 +237,15 @@ final class MainViewModel: ObservableObject, CameraManagerDelegate {
         }
     }
 
-    // MARK: - Answer cache (#4)
+    // MARK: - Answer cache
 
     private func cacheAnswer(_ answer: String, for key: String) {
         if answerCache.count >= answerCacheLimit {
-            // Cheap eviction: just drop everything once we hit the cap
-            // rather than tracking LRU order for a 50-entry hobby cache.
             answerCache.removeAll()
         }
         answerCache[key] = answer
     }
 
-    /// Collapses whitespace/case/newline differences so near-identical OCR
-    /// passes over the same physical text hit the same cache key even if
-    /// Vision's exact line-breaking varies slightly between frames.
     private static func normalize(_ text: String) -> String {
         text
             .lowercased()
@@ -251,7 +254,7 @@ final class MainViewModel: ObservableObject, CameraManagerDelegate {
             .joined(separator: " ")
     }
 
-    // MARK: - Daily quota counter (advisory, client-side)
+    // MARK: - Daily quota counter
 
     private func loadQuotaCounter() {
         let defaults = UserDefaults.standard
@@ -261,7 +264,6 @@ final class MainViewModel: ObservableObject, CameraManagerDelegate {
         if storedDateString == todayString {
             requestsUsedToday = defaults.integer(forKey: quotaCountKey)
         } else {
-            // New day (or first launch) — reset the counter.
             requestsUsedToday = 0
             defaults.set(todayString, forKey: quotaDateKey)
             defaults.set(0, forKey: quotaCountKey)
@@ -272,7 +274,6 @@ final class MainViewModel: ObservableObject, CameraManagerDelegate {
         let defaults = UserDefaults.standard
         let todayString = Self.dateKeyString(for: Date())
         if defaults.string(forKey: quotaDateKey) != todayString {
-            // Crossed midnight since the app launched — reset before counting.
             requestsUsedToday = 0
             defaults.set(todayString, forKey: quotaDateKey)
         }
