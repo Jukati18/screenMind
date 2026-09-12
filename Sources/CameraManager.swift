@@ -2,16 +2,10 @@ import AVFoundation
 import CoreVideo
 import UIKit
 
-/// Delegate used to hand raw camera frames up to whoever wants to run OCR on them.
-/// Kept as a plain protocol (not Combine) so the hot path stays lightweight.
 protocol CameraManagerDelegate: AnyObject {
     func cameraManager(_ manager: CameraManager, didOutput pixelBuffer: CVPixelBuffer)
 }
 
-/// Owns the AVCaptureSession lifecycle: permissions, device configuration,
-/// and streaming frames to a delegate. All AVCaptureSession mutations happen
-/// on a private serial queue, per Apple's guidance (never touch the session
-/// from the main thread synchronously).
 final class CameraManager: NSObject, ObservableObject {
 
     @Published var isAuthorized = false
@@ -25,6 +19,14 @@ final class CameraManager: NSObject, ObservableObject {
     private var currentDevice: AVCaptureDevice?
 
     weak var delegate: CameraManagerDelegate?
+
+    // CHANGE: exposes whether the camera is still adjusting focus, so the
+    // view model could factor this into its blur-retry loop if desired.
+    // Reading AVCaptureDevice properties from any thread is safe per
+    // Apple's docs — only *changes* need lockForConfiguration.
+    var isAdjustingFocus: Bool {
+        currentDevice?.isAdjustingFocus ?? false
+    }
 
     // MARK: - Permissions
 
@@ -62,8 +64,6 @@ final class CameraManager: NSObject, ObservableObject {
             if self.session.canSetSessionPreset(.hd1920x1080) {
                 self.session.sessionPreset = .hd1920x1080
             } else if self.session.canSetSessionPreset(.hd1280x720) {
-                // CHANGE: kept the old 720p as a fallback for configurations
-                // that can't do 1080p.
                 self.session.sessionPreset = .hd1280x720
             }
 
@@ -86,8 +86,11 @@ final class CameraManager: NSObject, ObservableObject {
                 self.session.addOutput(self.videoOutput)
             }
 
-            // Continuous autofocus/exposure noticeably improves OCR accuracy
-            // on close-up text (books, worksheets) versus a fixed focus point.
+            if let connection = self.videoOutput.connection(with: .video),
+               connection.isVideoOrientationSupported {
+                connection.videoOrientation = .portrait
+            }
+
             try? device.lockForConfiguration()
             if device.isFocusModeSupported(.continuousAutoFocus) {
                 device.focusMode = .continuousAutoFocus
@@ -96,6 +99,41 @@ final class CameraManager: NSObject, ObservableObject {
                 device.exposureMode = .continuousAutoExposure
             }
             device.unlockForConfiguration()
+        }
+    }
+
+    // MARK: - Focus (CHANGE: new)
+
+    /// Locks focus (and exposure) on a specific point instead of relying
+    /// purely on continuous autofocus, which can keep "hunting" and never
+    /// settle sharply on close-up text like a worksheet or screen.
+    /// - Parameter point: normalized 0...1 in AVFoundation's device
+    ///   coordinate space — NOT the same convention as Vision's
+    ///   regionOfInterest. See MainViewModel.focusCameraOnROI for the
+    ///   conversion from our on-screen ROI to this coordinate space.
+    func focus(on point: CGPoint) {
+        sessionQueue.async { [weak self] in
+            guard let self, let device = self.currentDevice else { return }
+            do {
+                try device.lockForConfiguration()
+                if device.isFocusPointOfInterestSupported {
+                    device.focusPointOfInterest = point
+                }
+                if device.isFocusModeSupported(.autoFocus) {
+                    device.focusMode = .autoFocus
+                }
+                if device.isExposurePointOfInterestSupported {
+                    device.exposurePointOfInterest = point
+                }
+                if device.isExposureModeSupported(.continuousAutoExposure) {
+                    device.exposureMode = .continuousAutoExposure
+                }
+                device.unlockForConfiguration()
+            } catch {
+                // CHANGE: focus lock is a best-effort enhancement — if it
+                // fails, just keep whatever focus mode was already active
+                // rather than surfacing an error to the user.
+            }
         }
     }
 

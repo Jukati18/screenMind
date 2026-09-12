@@ -18,6 +18,11 @@ final class MainViewModel: ObservableObject, CameraManagerDelegate {
     @Published var requestsUsedToday: Int = 0
     let estimatedDailyQuota = 20
 
+    // CHANGE: new — published so the UI can show a live sharpness score.
+    // Use this to calibrate `minimumSharpnessScore` below against your real
+    // device/lighting before considering the badge in ContentView optional.
+    @Published var currentSharpnessScore: Double = 0
+
     @Published var regionOfInterest: CGRect = CGRect(x: 0.1, y: 0.32, width: 0.8, height: 0.36)
 
     // MARK: - Dependencies
@@ -27,9 +32,6 @@ final class MainViewModel: ObservableObject, CameraManagerDelegate {
     private let geminiService = GeminiService(apiKey: Secrets.geminiAPIKey)
     private var changeDetector = TextChangeDetector()
 
-    // CHANGE: keeps the most recent camera frame around so the manual "Ask"
-    // action can run a fresh, high-accuracy, cropped OCR pass on demand,
-    // instead of reusing whatever the low-effort live-preview pass last saw.
     private var latestPixelBuffer: CVPixelBuffer?
 
     // MARK: - Throttling state
@@ -50,6 +52,18 @@ final class MainViewModel: ObservableObject, CameraManagerDelegate {
     private let quotaCountKey = "gemini_requests_used_today"
     private let quotaDateKey = "gemini_requests_date"
 
+    // CHANGE: new — blur-gate tuning. Watch the "sharp: N" badge (added in
+    // ContentView) in real conditions and adjust minimumSharpnessScore so
+    // it sits comfortably between your sharp and blurry readings.
+    private let minimumSharpnessScore: Double = 6.0
+    private let blurRetryLimit = 3
+    private let blurRetryDelayNanoseconds: UInt64 = 200_000_000 // 0.2s
+
+    // CHANGE: new — confidence-gate tuning. Vision's per-line confidence is
+    // 0...1; start here and adjust based on how often real scans get
+    // rejected vs. how often bad text still slips through.
+    private let minimumOCRConfidence: Float = 0.4
+
     init() {
         cameraManager.delegate = self
         cameraManager.checkPermissionsAndConfigure()
@@ -62,6 +76,7 @@ final class MainViewModel: ObservableObject, CameraManagerDelegate {
         isRunning = true
         state = .scanning
         cameraManager.startSession()
+        focusCameraOnROI() // CHANGE: lock focus on the current ROI as soon as scanning starts.
     }
 
     func pause() {
@@ -89,19 +104,34 @@ final class MainViewModel: ObservableObject, CameraManagerDelegate {
         UIPasteboard.general.string = geminiAnswer
     }
 
-    // MARK: - CameraManagerDelegate (called on a background video queue)
+    // MARK: - Focus (CHANGE: new)
+
+    /// Locks the camera's focus/exposure on the ROI box's center. Called
+    /// when scanning starts and whenever the user finishes dragging the ROI
+    /// (see ContentView), so continuous autofocus — which can keep
+    /// "hunting" on close-up text — gets a specific point to settle on.
+    func focusCameraOnROI() {
+        let center = CGPoint(x: regionOfInterest.midX, y: regionOfInterest.midY)
+        // CHANGE: convert from our view-space convention (x right, y down,
+        // origin top-left) to AVFoundation's focusPointOfInterest
+        // convention for a back camera locked to `.portrait`
+        // videoOrientation: x_device = y_view, y_device = 1 - x_view.
+        // Verify on your actual device — if focus consistently locks on the
+        // wrong part of the frame, swap/invert these two lines to match.
+        let devicePoint = CGPoint(x: center.y, y: 1 - center.x)
+        cameraManager.focus(on: devicePoint)
+    }
+
+    // MARK: - CameraManagerDelegate
 
     nonisolated func cameraManager(_ manager: CameraManager, didOutput pixelBuffer: CVPixelBuffer) {
         Task { @MainActor [weak self] in
-            // CHANGE: always store the freshest frame, independent of the
-            // preview OCR throttle below, so a tap on "Ask" always has an
-            // up-to-date buffer to run the accurate scan against.
             self?.latestPixelBuffer = pixelBuffer
             await self?.handleFrame(pixelBuffer)
         }
     }
 
-    // MARK: - Frame handling / OCR (preview only — unchanged: still .fast, uncropped, for a cheap live overlay)
+    // MARK: - Frame handling / OCR (preview only)
 
     private func handleFrame(_ pixelBuffer: CVPixelBuffer) async {
         guard isRunning, !isProcessingFrame else { return }
@@ -112,14 +142,20 @@ final class MainViewModel: ObservableObject, CameraManagerDelegate {
         isProcessingFrame = true
         defer { isProcessingFrame = false }
 
-        let visionROI = Self.convertToVisionSpace(regionOfInterest)
-        // NOTE: deliberately left as the old .fast / uncropped / 0.02 call —
-        // this is just the cheap live-preview text shown under the camera,
-        // not what gets sent to Gemini anymore (see performAccurateScanAndAsk).
-        let text = await ocrProcessor.recognizeText(in: pixelBuffer, regionOfInterest: visionROI)
+        // CHANGE: piggybacks on the existing 1s throttle so this costs
+        // nothing extra — cheap on its own (fixed 64x64 grid) but no reason
+        // to run it more often than the preview OCR already runs.
+        if let score = BlurDetector.sharpnessScore(for: pixelBuffer) {
+            currentSharpnessScore = score
+        }
 
-        guard !text.isEmpty else { return }
-        currentOCRText = text
+        let visionROI = Self.convertToVisionSpace(regionOfInterest)
+        // CHANGE: recognizeText now returns OCRResult instead of a bare
+        // String — preview only needs the text, confidence is ignored here.
+        let result = await ocrProcessor.recognizeText(in: pixelBuffer, regionOfInterest: visionROI)
+
+        guard !result.text.isEmpty else { return }
+        currentOCRText = result.text
         if isRunning { state = .scanning }
     }
 
@@ -134,24 +170,14 @@ final class MainViewModel: ObservableObject, CameraManagerDelegate {
 
     // MARK: - Manual "Ask Gemini" trigger
 
-    /// CHANGE: this no longer reuses the low-effort preview text. It now
-    /// kicks off a fresh, high-accuracy, ROI-cropped OCR pass first (see
-    /// performAccurateScanAndAsk), and only that result is ever sent to
-    /// Gemini or checked against cache/dedupe/quota.
     func askGemini() {
-        // CHANGE: bail out immediately if we don't have a frame yet, before
-        // doing any OCR work at all.
         guard let pixelBuffer = latestPixelBuffer else { return }
 
-        // Guard 1: accidental double-tap protection — checked first, before
-        // spending effort on an accurate OCR pass.
         let now = Date()
         guard now.timeIntervalSince(lastGeminiCallTime) >= manualAskCooldown else { return }
 
         currentGeminiTask?.cancel()
         pendingRetryTask?.cancel()
-        // CHANGE: reflects that real work (accurate OCR + possibly network)
-        // is starting now, not just the network call.
         state = .sendingToAI
 
         currentGeminiTask = Task { [weak self] in
@@ -160,28 +186,56 @@ final class MainViewModel: ObservableObject, CameraManagerDelegate {
         }
     }
 
-    // CHANGE: new — runs the high-accuracy, cropped-to-ROI OCR pass at the
-    // moment of the tap, then falls through into the same cache/dedupe/quota
-    // logic askGemini() used to run directly on the preview text.
-    private func performAccurateScanAndAsk(pixelBuffer: CVPixelBuffer) async {
+    // CHANGE: runs the high-accuracy, cropped-to-ROI OCR pass at the moment
+    // of the tap. Now gated by two new quality checks before anything is
+    // sent to Gemini:
+    //   1. A blur/sharpness pre-check (with a few short retries against
+    //      fresh frames) — skips running OCR at all on a frame that's still
+    //      shaking or out of focus.
+    //   2. An OCR-confidence post-check — skips sending text to Gemini that
+    //      Vision itself wasn't confident about, even if some text came
+    //      back.
+    // Both surface a clear, actionable error instead of silently producing a
+    // bad answer or spending a Gemini quota slot on garbage input.
+    private func performAccurateScanAndAsk(pixelBuffer initialPixelBuffer: CVPixelBuffer) async {
+        var pixelBuffer = initialPixelBuffer
+
+        var attempt = 0
+        while let score = BlurDetector.sharpnessScore(for: pixelBuffer),
+              score < minimumSharpnessScore,
+              attempt < blurRetryLimit {
+            attempt += 1
+            try? await Task.sleep(nanoseconds: blurRetryDelayNanoseconds)
+            guard let freshest = latestPixelBuffer else { break }
+            pixelBuffer = freshest
+        }
+
+        if let finalScore = BlurDetector.sharpnessScore(for: pixelBuffer), finalScore < minimumSharpnessScore {
+            state = .error("Image too blurry (sharpness \(Int(finalScore))) — hold steady and make sure the text is in focus, then try again.")
+            return
+        }
+
         let visionROI = Self.convertToVisionSpace(regionOfInterest)
 
-        let text = await ocrProcessor.recognizeText(
+        let result = await ocrProcessor.recognizeText(
             in: pixelBuffer,
             regionOfInterest: visionROI,
-            recognitionLevel: .accurate,   // CHANGE: worth the extra cost since this only runs once per tap.
-            minimumTextHeight: 0.01,       // CHANGE: lowered so smaller multiple-choice text isn't filtered before recognition starts.
-            cropToRegion: true             // CHANGE: crop first so the text occupies nearly the whole analyzed image.
+            recognitionLevel: .accurate,
+            minimumTextHeight: 0.01,
+            cropToRegion: true
         )
 
-        guard !text.isEmpty else {
-            // CHANGE: clear, actionable message instead of silently doing nothing.
+        guard !result.text.isEmpty else {
             state = .error("No text found in the scan box — reposition it over the question and try again.")
             return
         }
 
-        // CHANGE: reflect exactly what was actually sent/considered, since it
-        // may differ from the fast live-preview text.
+        guard result.averageConfidence >= minimumOCRConfidence else {
+            state = .error("Scan confidence too low (\(Int(result.averageConfidence * 100))%) — move closer or hold steadier, then try again.")
+            return
+        }
+
+        let text = result.text
         currentOCRText = text
 
         let key = Self.normalize(text)
@@ -192,8 +246,6 @@ final class MainViewModel: ObservableObject, CameraManagerDelegate {
         }
 
         guard changeDetector.shouldSend(newText: text) else {
-            // CHANGE: reset state instead of leaving it stuck on "Sending to AI…"
-            // now that state is set earlier in askGemini().
             state = isRunning ? .scanning : .idle
             return
         }

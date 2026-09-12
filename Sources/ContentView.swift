@@ -53,10 +53,8 @@ struct ContentView: View {
     private var topBar: some View {
         HStack(spacing: 12) {
             statusBadge
-            // CHANGE (#4 UI): shows the client-side daily-quota estimate next
-            // to the status badge, e.g. "3/20 today" — helps the user avoid
-            // wasting a tap when close to the free-tier RPD cap.
             quotaBadge
+            sharpnessBadge // CHANGE: new — live sharpness score for calibrating BlurDetector's threshold.
             Spacer()
 
             Button {
@@ -98,9 +96,22 @@ struct ContentView: View {
         .background(.ultraThinMaterial, in: Capsule())
     }
 
-    // CHANGE: new small badge showing "{used}/{estimatedDailyQuota} today".
     private var quotaBadge: some View {
         Text("\(viewModel.requestsUsedToday)/\(viewModel.estimatedDailyQuota) today")
+            .font(.caption2.weight(.medium))
+            .foregroundStyle(.white.opacity(0.85))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(.ultraThinMaterial, in: Capsule())
+    }
+
+    // CHANGE: new — diagnostic badge showing the live blur/sharpness score.
+    // Once you've picked a good `minimumSharpnessScore` in MainViewModel by
+    // watching this number in different real conditions, feel free to
+    // remove this badge (and `currentSharpnessScore`) if you don't want it
+    // as permanent UI.
+    private var sharpnessBadge: some View {
+        Text("sharp: \(Int(viewModel.currentSharpnessScore))")
             .font(.caption2.weight(.medium))
             .foregroundStyle(.white.opacity(0.85))
             .padding(.horizontal, 8)
@@ -149,11 +160,14 @@ struct ContentView: View {
                         )
                         viewModel.regionOfInterest = newRect
                     }
-                    .onEnded { _ in dragStartRect = nil }
+                    .onEnded { _ in
+                        dragStartRect = nil
+                        viewModel.focusCameraOnROI() // CHANGE: re-lock focus on the new ROI position after dragging.
+                    }
             )
     }
 
-    // MARK: - OCR text overlay
+    // MARK: - OCR text overlay (unchanged)
 
     private var ocrTextOverlay: some View {
         ScrollView {
@@ -168,7 +182,7 @@ struct ContentView: View {
         .padding(.horizontal)
     }
 
-    // MARK: - Bottom answer sheet
+    // MARK: - Bottom answer sheet (unchanged)
 
     private var answerSheet: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -187,9 +201,6 @@ struct ContentView: View {
                 .disabled(viewModel.geminiAnswer.isEmpty)
             }
 
-            // CHANGE (#3): the manual trigger — replaces the old always-on
-            // auto-send loop. Disabled whenever there's nothing to ask,
-            // a request is already in flight, or OCR hasn't found text yet.
             Button {
                 viewModel.askGemini()
             } label: {
@@ -234,8 +245,6 @@ struct ContentView: View {
         .padding()
     }
 }
-
-// MARK: - Reusable circular toolbar button style
 
 struct ToolbarCircleButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
