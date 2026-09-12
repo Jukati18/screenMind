@@ -7,7 +7,7 @@ struct ContentView: View {
     var body: some View {
         GeometryReader { geo in
             ZStack {
-                CameraPreviewView(session: viewModel.cameraManager.session)
+                CameraPreviewView(cameraManager: viewModel.cameraManager)
                     .ignoresSafeArea()
 
                 roiOverlay(in: geo.size)
@@ -90,6 +90,7 @@ struct ContentView: View {
             Text(viewModel.state.label)
                 .font(.caption.weight(.medium))
                 .foregroundStyle(.white)
+                .fixedSize() // CHANGE: prevent wrapping now that 3 badges share the top bar.
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
@@ -167,7 +168,7 @@ struct ContentView: View {
             )
     }
 
-    // MARK: - OCR text overlay (unchanged)
+    // MARK: - OCR text overlay 
 
     private var ocrTextOverlay: some View {
         ScrollView {
@@ -182,7 +183,7 @@ struct ContentView: View {
         .padding(.horizontal)
     }
 
-    // MARK: - Bottom answer sheet (unchanged)
+    // MARK: - Bottom answer sheet 
 
     private var answerSheet: some View {
         VStack(alignment: .leading, spacing: 12) {

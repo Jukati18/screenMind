@@ -13,6 +13,14 @@ final class CameraManager: NSObject, ObservableObject {
 
     let session = AVCaptureSession()
 
+    // CHANGE: weak reference to the actual preview layer, set by
+    // CameraPreviewView once it creates one. Used by focus(atNormalizedPoint:)
+    // to convert on-screen points into device focus coordinates via
+    // AVFoundation's own captureDevicePointConverted(fromLayerPoint:) —
+    // this replaces the hand-rolled coordinate formula that was getting the
+    // mapping wrong and locking focus on the wrong part of the scene.
+    weak var previewLayer: AVCaptureVideoPreviewLayer?
+
     private let videoOutput = AVCaptureVideoDataOutput()
     private let sessionQueue = DispatchQueue(label: "camera.session.queue")
     private let videoQueue = DispatchQueue(label: "camera.video.queue", qos: .userInitiated)
@@ -20,15 +28,11 @@ final class CameraManager: NSObject, ObservableObject {
 
     weak var delegate: CameraManagerDelegate?
 
-    // CHANGE: exposes whether the camera is still adjusting focus, so the
-    // view model could factor this into its blur-retry loop if desired.
-    // Reading AVCaptureDevice properties from any thread is safe per
-    // Apple's docs — only *changes* need lockForConfiguration.
     var isAdjustingFocus: Bool {
         currentDevice?.isAdjustingFocus ?? false
     }
 
-    // MARK: - Permissions
+    // MARK: - Permissions 
 
     func checkPermissionsAndConfigure() {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
@@ -52,7 +56,7 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - Session configuration
+    // MARK: - Session configuration 
 
     private func configureSession() {
         sessionQueue.async { [weak self] in
@@ -102,37 +106,64 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - Focus (CHANGE: new)
+    // MARK: - Focus (CHANGE: rewritten — fixes the regression)
 
-    /// Locks focus (and exposure) on a specific point instead of relying
-    /// purely on continuous autofocus, which can keep "hunting" and never
-    /// settle sharply on close-up text like a worksheet or screen.
-    /// - Parameter point: normalized 0...1 in AVFoundation's device
-    ///   coordinate space — NOT the same convention as Vision's
-    ///   regionOfInterest. See MainViewModel.focusCameraOnROI for the
-    ///   conversion from our on-screen ROI to this coordinate space.
-    func focus(on point: CGPoint) {
+    /// Continuously focuses/exposes around a specific on-screen point.
+    ///
+    /// FIX: the previous version (a) computed the device-space point with a
+    /// hand-written formula guessing at the sensor/orientation mapping, and
+    /// (b) used `.autoFocus` — a ONE-SHOT mode that adjusts focus once and
+    /// then freezes, so a wrong point (or the phone moving afterward) left
+    /// the camera permanently out of focus. That combination is what made
+    /// scanning noticeably worse than plain continuous autofocus.
+    ///
+    /// This version instead:
+    /// 1. Uses `AVCaptureVideoPreviewLayer.captureDevicePointConverted` —
+    ///    Apple's own orientation-aware conversion — instead of manual math.
+    /// 2. Uses `.continuousAutoFocus` with a focus *point of interest* set,
+    ///    so the camera keeps re-adjusting around that point as distance or
+    ///    lighting changes, the way tap-to-focus works in Apple's own
+    ///    Camera app.
+    ///
+    /// - Parameter normalizedPoint: a point in the SAME coordinate space
+    ///   ContentView already uses for `regionOfInterest`: 0...1, x
+    ///   increasing right, y increasing down, origin at the preview's
+    ///   top-left.
+    func focus(atNormalizedPoint normalizedPoint: CGPoint) {
+        // CHANGE: captureDevicePointConverted touches the UIKit layer, so
+        // it must run on the main thread — then hop to sessionQueue for the
+        // actual device configuration.
+        guard let previewLayer, previewLayer.bounds.width > 0, previewLayer.bounds.height > 0 else { return }
+
+        let layerPoint = CGPoint(
+            x: normalizedPoint.x * previewLayer.bounds.width,
+            y: normalizedPoint.y * previewLayer.bounds.height
+        )
+        let devicePoint = previewLayer.captureDevicePointConverted(fromLayerPoint: layerPoint)
+
         sessionQueue.async { [weak self] in
             guard let self, let device = self.currentDevice else { return }
             do {
                 try device.lockForConfiguration()
                 if device.isFocusPointOfInterestSupported {
-                    device.focusPointOfInterest = point
+                    device.focusPointOfInterest = devicePoint
                 }
-                if device.isFocusModeSupported(.autoFocus) {
-                    device.focusMode = .autoFocus
+                // CHANGE: continuousAutoFocus (not one-shot autoFocus) so
+                // the camera keeps adjusting around this point instead of
+                // freezing after a single pass.
+                if device.isFocusModeSupported(.continuousAutoFocus) {
+                    device.focusMode = .continuousAutoFocus
                 }
                 if device.isExposurePointOfInterestSupported {
-                    device.exposurePointOfInterest = point
+                    device.exposurePointOfInterest = devicePoint
                 }
                 if device.isExposureModeSupported(.continuousAutoExposure) {
                     device.exposureMode = .continuousAutoExposure
                 }
                 device.unlockForConfiguration()
             } catch {
-                // CHANGE: focus lock is a best-effort enhancement — if it
-                // fails, just keep whatever focus mode was already active
-                // rather than surfacing an error to the user.
+                // Best-effort — if this fails, whatever focus mode was
+                // already active just keeps running.
             }
         }
     }

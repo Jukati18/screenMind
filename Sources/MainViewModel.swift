@@ -104,22 +104,17 @@ final class MainViewModel: ObservableObject, CameraManagerDelegate {
         UIPasteboard.general.string = geminiAnswer
     }
 
-    // MARK: - Focus (CHANGE: new)
+    // MARK: - Focus
 
-    /// Locks the camera's focus/exposure on the ROI box's center. Called
+    /// Focuses the camera continuously around the ROI box's center. Called
     /// when scanning starts and whenever the user finishes dragging the ROI
-    /// (see ContentView), so continuous autofocus — which can keep
-    /// "hunting" on close-up text — gets a specific point to settle on.
+    /// (see ContentView).
+    /// CHANGE: coordinate math now lives entirely in CameraManager (via the
+    /// preview layer's own conversion) — removed the manual axis-swapping
+    /// formula that was the root cause of the focus regression.
     func focusCameraOnROI() {
         let center = CGPoint(x: regionOfInterest.midX, y: regionOfInterest.midY)
-        // CHANGE: convert from our view-space convention (x right, y down,
-        // origin top-left) to AVFoundation's focusPointOfInterest
-        // convention for a back camera locked to `.portrait`
-        // videoOrientation: x_device = y_view, y_device = 1 - x_view.
-        // Verify on your actual device — if focus consistently locks on the
-        // wrong part of the frame, swap/invert these two lines to match.
-        let devicePoint = CGPoint(x: center.y, y: 1 - center.x)
-        cameraManager.focus(on: devicePoint)
+        cameraManager.focus(atNormalizedPoint: center)
     }
 
     // MARK: - CameraManagerDelegate
