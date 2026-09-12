@@ -58,7 +58,7 @@ final class GeminiService {
     ///     Google's "latest Flash" alias.
     init(
         apiKey: String = "YOUR_GEMINI_API_KEY",
-        model: String = "gemini-2.0-flash-lite",
+        model: String = "gemini-3.5-flash-lite",
         fallbackModel: String = "gemini-flash-latest"
     ) {
         self.apiKey = apiKey
@@ -149,6 +149,9 @@ final class GeminiService {
     private static func isModelNotFound(_ message: String) -> Bool {
         message.localizedCaseInsensitiveContains("is not found for API version")
             || message.localizedCaseInsensitiveContains("NOT_FOUND")
+            || message.localizedCaseInsensitiveContains("no longer available")
+            || message.localizedCaseInsensitiveContains("is deprecated")
+            || message.localizedCaseInsensitiveContains("is not supported")
     }
 
     // MARK: - Prompt engineering for dirty OCR text
